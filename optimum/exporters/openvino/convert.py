@@ -35,6 +35,7 @@ from optimum.exporters.onnx.convert import export_tensorflow as export_tensorflo
 from optimum.utils import DEFAULT_DUMMY_SHAPES, is_diffusers_available
 from optimum.utils.save_utils import maybe_save_preprocessors
 
+from .gguf_param_extractors import get_gguf_params
 from ...intel.utils.import_utils import is_nncf_available, is_optimum_version
 from .model_patcher import patch_model_with_bettertransformer
 from .stateful import ensure_export_task_support_stateful, ensure_stateful_is_available, patch_stateful
@@ -387,6 +388,11 @@ def export_pytorch(
             )
 
         sig = inspect.signature(model.forward) if hasattr(model, "forward") else inspect.signature(model.call)
+        print("VSHAMPOR: get_gguf_params")
+        gguf_params = get_gguf_params(model)
+        print("VSHAMPOR: set_rt_info")
+        ov_model.set_rt_info(gguf_params, "gguf_params")
+        print("VSHAMPOR: success")
         ordered_dummy_inputs = {param: dummy_inputs[param] for param in sig.parameters if param in dummy_inputs}
         ordered_input_names = list(inputs)
         flatten_inputs = flattenize_inputs(ordered_dummy_inputs.values())
