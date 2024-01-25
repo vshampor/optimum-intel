@@ -254,6 +254,16 @@ def export_pytorch_via_onnx(
     _save_model(ov_model, output.parent / OV_XML_FILE_NAME if output.suffix != ".xml" else output, ov_config=ov_config)
     return input_names, output_names, True
 
+def direct_ptfe(model, example_inputs, fem_input):
+    print("VSHAMPOR: direct PTFE")
+    from openvino._pyopenvino import FrontEndManager
+    from openvino.frontend.pytorch.ts_decoder import TorchScriptPythonDecoder
+    fem = FrontEndManager()
+    moc_front_end = fem.load_by_framework('pytorch')
+    decoder = TorchScriptPythonDecoder(model, example_input=example_inputs)
+    input_model = moc_front_end.load(decoder)
+    ov_model = moc_front_end.convert(input_model)
+    return ov_model
 
 def export_pytorch(
     model: Union["PreTrainedModel", "ModelMixin"],
@@ -363,8 +373,8 @@ def export_pytorch(
                 output_names = list(config.outputs.keys())
                 input_info = get_input_shapes(dummy_inputs, inputs)
 
-                ov_model = convert_model(model, example_input=dummy_inputs, input=input_info)
-
+                #ov_model = convert_model(model, example_input=dummy_inputs, input=input_info)
+                ov_model = direct_ptfe(model, dummy_inputs, input_info)
         except Exception as ex:
             logger.warning(f"Export model to OpenVINO directly failed with: \n{ex}.\nModel will be exported to ONNX")
 
