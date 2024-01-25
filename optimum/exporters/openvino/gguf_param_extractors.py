@@ -244,6 +244,7 @@ class GGUFExportedModelDescriptor:
 
     def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
         for name, data in self.model.state_dict().items():
+            print(f"VSHAMPOR: tensor name {name} dtype {data.dtype}")
             yield name, data
 
     def set_gguf_parameters(self):
@@ -289,8 +290,16 @@ class GGUFExportedModelDescriptor:
             retval[torch_name] = gguf_name
         return retval
 
+    def get_tensor_shape_map(self) -> Dict[str, Tuple[int]]:
+        retval = {}
+        for name, tensor in self.get_tensors():
+            retval[name] = str(list(tensor.shape))
+        return retval
+
+
     def get_params_dict(self) -> Dict[str, Any]:
-        retval = {"tensor_name_map": self.get_tensor_name_map()}
+        retval = {"tensor_name_map": self.get_tensor_name_map(),
+                  "tensor_shape_map": self.get_tensor_shape_map()}
         retval.update(self.gguf_param_store.get_params_dict())
         return retval
 
