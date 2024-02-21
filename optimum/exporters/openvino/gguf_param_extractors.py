@@ -25,6 +25,9 @@ if 'NO_LOCAL_GGUF' not in os.environ:
 import gguf
 
 
+FP16_TYPE = "fp16"
+FP32_TYPE = "fp32"
+
 ###### MODEL DEFINITIONS ######
 
 class SentencePieceTokenTypes(IntEnum):
@@ -238,8 +241,14 @@ class GGUFExportedModelDescriptor:
         self.model = model
         self.ftype = gguf.GGMLQuantizationType.F32
         self.hparams = self.model.config.to_dict()
+        self._block_count = self.hparams.get("n_layers", self.hparams.get("num_hidden_layers", self.hparams.get("n_layer")))
         self.model_arch = self._get_model_architecture()
         self.gguf_param_store = GGUFParamStore(gguf.MODEL_ARCH_NAMES[self.model_arch])
+        self._tensor_name_map: Dict[str, str] = {}
+        self._tensor_shape_map: Dict[str, List[int, ...]] = {}
+        self._tensor_type_map: Dict[str, str] = {}
+        self._transpose_permutations: Dict[str, List[int, ...]] = {}
+        self._expected_tensor_shapes: Dict[str, List[int, ...]] = {}
 
     def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
         for name, data in self.model.state_dict().items():
@@ -271,9 +280,57 @@ class GGUFExportedModelDescriptor:
 
         self.gguf_param_store.add_parallel_residual(self.hparams.get("use_parallel_residual", True))
 
+    def write_tensors(self):
+        tensor_map = gguf.get_tensor_name_map(self.model_arch, self._block_count)
+        for name, data_torch in self.get_tensors():
+            # we don't need these
+            if name.endswith((".attention.masked_bias", ".attention.bias", ".attention.rotary_emb.inv_freq")):
+                continue
+
+            new_name = tensor_map.get_name(name, try_suffixes=(".weight", ".bias"))
+
+            self._tensor_name_map[new_name] = name
+            self._tensor_shape_map[new_name] = list(data_torch.shape)
+
+            # convert any unsupported data types to float32
+            self._write_default_tensor_type(new_name, data_torch.dtype)
+            self._write_tensor_type_from_ftype(name, data_dtype)
+
+            data = data_torch.squeeze().numpy()
+
+            # map tensor names
+            if new_name is None:
+                print(f"Can not map tensor {name!r}")
+                sys.exit()
+
+            self._expected_tensor_shapes[new_name] = list(data.shape)
+
+    def _write_default_tensor_type(self, torch_name: str, torch_dtype: torch.dtype):
+        if torch_dtype not in (torch.float16, torch.float32):
+           self._tensor_type_map[torch_name] = FP32_TYPE
+        elif torch_dtype == torch.float32:
+           self._tensor_type_map[torch_name] = FP32_TYPE
+        elif torch_dtype == torch.float16:
+           self._tensor_type_map[torch_name] = FP16_TYPE
+
+    def _write_tensor_type_from_ftype(self, torch_name: str, torch_dtype: torch.dtype):
+        # if f32 desired, convert any float16 to float32
+        if self.ftype == 0 and torch_dtype == np.float16:
+            self._tensor_type_map[name] = FP32_TYPE
+
+        # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
+        if self.ftype == 1 and torch_dtype == np.float16 and n_dims == 1:
+            self._tensor_type_map[name] = FP32_TYPE
+
+        # if f16 desired, convert any float32 2-dim weight tensors to float16
+        if self.ftype == 1 and torch_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
+            self._tensor_type_map[name] = FP32_TYPE
+
+    def write_model_specicic_tensor_infos(self):
+        self.write_tensors()
+
     def get_tensor_name_map(self) -> Dict[str, str]:
-        block_count = self.hparams.get("n_layers", self.hparams.get("num_hidden_layers", self.hparams.get("n_layer")))
-        tensor_map = gguf.get_tensor_name_map(self.model_arch, block_count)
+        tensor_map = gguf.get_tensor_name_map(self.model_arch, self._block_count)
         retval = {}
         for torch_name, data_torch in self.get_tensors():
             # we don't need these
@@ -287,16 +344,27 @@ class GGUFExportedModelDescriptor:
             retval[torch_name] = gguf_name
         return retval
 
-    def get_tensor_shape_map(self) -> Dict[str, Tuple[int]]:
+    def get_torch_tensor_shape_map(self) -> Dict[str, Tuple[int]]:
         retval = {}
         for name, tensor in self.get_tensors():
             retval[name] = str(list(tensor.shape))
         return retval
 
+    def _write_shared_tensor(self, shared_llama_name: str, share_with_llama_name: str):
+        for _map in (self._tensor_name_map, self._tensor_shape_map, self._expected_tensor_shapes, self._tensor_type_map):
+            assert share_with_llama_name in _map
+            _map[shared_llama_name] = _map[share_with_llama_name]
+
+    @staticmethod
+    def _val_to_str(d: Dict) -> Dict:
+        return {k: str(v) for k, v in d.items()}
 
     def get_params_dict(self) -> Dict[str, Any]:
-        retval = {"tensor_name_map": self.get_tensor_name_map(),
-                  "tensor_shape_map": self.get_tensor_shape_map(),
+        retval = {"tensor_name_map": self._tensor_name_map.copy(),
+                  "tensor_shape_map": self._val_to_str(self._tensor_shape_map),
+                  "tensor_type_map": self._tensor_type_map.copy(),
+                  "transpose_permutations": self._transpose_permutations.copy(),
+                  "expected_tensor_shapes": self._val_to_str(self._expected_tensor_shapes.copy()),
                   "kv": self.gguf_param_store.get_params_dict(),
                   "kv_types": self.gguf_param_store.kv_types.copy()}
         return retval
@@ -415,8 +483,7 @@ class BloomModel(GGUFExportedModelDescriptor):
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
+            self._write_default_tensor_type(name, data_torch.dtype)
 
             data = data_torch.squeeze().numpy()
 
@@ -455,18 +522,7 @@ class BloomModel(GGUFExportedModelDescriptor):
             n_dims = len(data.shape)
             data_dtype = data.dtype
 
-            # if f32 desired, convert any float16 to float32
-            if self.ftype == 0 and data_dtype == np.float16:
-                data = data.astype(np.float32)
-
-            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
-            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
-                data = data.astype(np.float32)
-
-            # if f16 desired, convert any float32 2-dim weight tensors to float16
-            if self.ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
-                data = data.astype(np.float16)
-
+            self._write_tensor_type_from_ftype(name, data_dtype)
             print(f"=> {new_name}, shape = {data.shape}, {old_dtype} --> {data.dtype}")
 
             self.gguf_param_store.add_tensor(new_name, data)
@@ -503,8 +559,7 @@ class MPTModel(GGUFExportedModelDescriptor):
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
+            self._write_default_tensor_type(name, data_torch.dtype)
 
             data = data_torch.squeeze().numpy()
 
@@ -521,17 +576,7 @@ class MPTModel(GGUFExportedModelDescriptor):
             n_dims = len(data.shape)
             data_dtype = data.dtype
 
-            # if f32 desired, convert any float16 to float32
-            if self.ftype == 0 and data_dtype == np.float16:
-                data = data.astype(np.float32)
-
-            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
-            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
-                data = data.astype(np.float32)
-
-            # if f16 desired, convert any float32 2-dim weight tensors to float16
-            if self.ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
-                data = data.astype(np.float16)
+            self._write_tensor_type_from_ftype(name, data_dtype)
 
             print(f"{new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
 
@@ -605,8 +650,7 @@ class BaichuanModel(GGUFExportedModelDescriptor):
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
+            self._write_default_tensor_type(name, data_torch.dtype)
 
             data = data_torch.squeeze().numpy()
 
@@ -619,18 +663,7 @@ class BaichuanModel(GGUFExportedModelDescriptor):
             n_dims = len(data.shape)
             data_dtype = data.dtype
 
-            # if f32 desired, convert any float16 to float32
-            if self.ftype == 0 and data_dtype == np.float16:
-                data = data.astype(np.float32)
-
-            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
-            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
-                data = data.astype(np.float32)
-
-            # if f16 desired, convert any float32 2-dim weight tensors to float16
-            if self.ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
-                data = data.astype(np.float16)
-
+            self._write_tensor_type_from_ftype(name, data_dtype)
             print(f"{name} -> {new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
             self.gguf_param_store.add_tensor(new_name, data)
 
@@ -700,8 +733,7 @@ class FalconModel(GGUFExportedModelDescriptor):
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
+            self._write_default_tensor_type(name, data_torch.dtype)
 
             # QKV tensor transform
             # The original query_key_value tensor contains n_head_kv "kv groups",
@@ -731,17 +763,7 @@ class FalconModel(GGUFExportedModelDescriptor):
             n_dims = len(data.shape)
             data_dtype = data.dtype
 
-            # if f32 desired, convert any float16 to float32
-            if self.ftype == 0 and data_dtype == np.float16:
-                data = data.astype(np.float32)
-
-            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
-            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
-                data = data.astype(np.float32)
-
-            # if f16 desired, convert any float32 2-dim weight tensors to float16
-            if self.ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
-                data = data.astype(np.float16)
+            self._write_tensor_type_from_ftype(name, data_dtype)
 
             print(f"{new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
 
@@ -816,8 +838,7 @@ class RefactModel(GGUFExportedModelDescriptor):
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
+            self._write_default_tensor_type(name, data_torch.dtype)
 
             data = data_torch.squeeze().numpy()
 
@@ -830,17 +851,7 @@ class RefactModel(GGUFExportedModelDescriptor):
             n_dims = len(data.shape)
             data_dtype = data.dtype
 
-            # if f32 desired, convert any float16 to float32
-            if self.ftype == 0 and data_dtype == np.float16:
-                data = data.astype(np.float32)
-
-            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
-            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
-                data = data.astype(np.float32)
-
-            # if f16 desired, convert any float32 2-dim weight tensors to float16
-            if self.ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
-                data = data.astype(np.float16)
+            self._write_tensor_type_from_ftype(name, data_dtype)
 
             print(f"{new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
 
@@ -951,8 +962,7 @@ class QwenModel(GGUFExportedModelDescriptor):
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
+            self._write_default_tensor_type(name, data_torch.dtype)
 
             data = data_torch.squeeze().numpy()
 
@@ -965,17 +975,7 @@ class QwenModel(GGUFExportedModelDescriptor):
             n_dims = len(data.shape)
             data_dtype = data.dtype
 
-            # if f32 desired, convert any float16 to float32
-            if self.ftype == 0 and data_dtype == np.float16:
-                data = data.astype(np.float32)
-
-            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
-            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
-                data = data.astype(np.float32)
-
-            # if f16 desired, convert any float32 2-dim weight tensors to float16
-            if self.ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
-                data = data.astype(np.float16)
+            self._write_tensor_type_from_ftype(name, data_dtype)
 
             print(f"{new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
             self.gguf_param_store.add_tensor(new_name, data)
@@ -993,24 +993,13 @@ class GPT2Model(GGUFExportedModelDescriptor):
         self.gguf_param_store.add_file_type(self.ftype)
 
     def write_tensors(self):
-        block_count = self.hparams.get("n_layers", self.hparams.get("num_hidden_layers", self.hparams.get("n_layer")))
-        tensor_map = gguf.get_tensor_name_map(self.model_arch, block_count)
+        tensor_map = gguf.get_tensor_name_map(self.model_arch, self._block_count)
 
         for name, data_torch in self.get_tensors():
+
             # we don't need these
             if name.endswith((".attention.masked_bias", ".attention.bias", ".attention.rotary_emb.inv_freq", ".attn.bias")):
                 continue
-
-            if name.endswith((".c_attn.weight", ".c_proj.weight", ".c_fc.weight", ".c_proj.weight")):
-                data_torch = data_torch.transpose(1, 0)
-
-            old_dtype = data_torch.dtype
-
-            # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
-
-            data = data_torch.squeeze().numpy()
 
             # map tensor names
             new_name = tensor_map.get_name(name, try_suffixes=(".weight", ".bias"))
@@ -1018,29 +1007,26 @@ class GPT2Model(GGUFExportedModelDescriptor):
                 print(f"Can not map tensor {name!r}")
                 sys.exit()
 
-            n_dims = len(data.shape)
-            data_dtype = data.dtype
+            elif new_name == "output.weight":
+                continue
 
-            # if f32 desired, convert any float16 to float32
-            if self.ftype == 0 and data_dtype == np.float16:
-                data = data.astype(np.float32)
+            self._tensor_name_map[new_name] = name
 
-            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
-            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
-                data = data.astype(np.float32)
+            self._tensor_shape_map[new_name] = list(data_torch.shape)
 
-            # if f16 desired, convert any float32 2-dim weight tensors to float16
-            if self.ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
-                data = data.astype(np.float16)
+            # convert any unsupported data types to float32
+            self._write_default_tensor_type(new_name, data_torch.dtype)
+            self._write_tensor_type_from_ftype(new_name, data_torch.dtype)
 
-            print(f"{new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
+            if name.endswith((".c_attn.weight", ".c_proj.weight", ".c_fc.weight", ".c_proj.weight")):
+                self._transpose_permutations[new_name] = [1, 0]
+                data_torch = data_torch.transpose(1, 0)
+            data = data_torch.squeeze().numpy()
+            self._expected_tensor_shapes[new_name] = list(data.shape)
 
-            self.gguf_param_store.add_tensor(new_name, data)
+        # note: GPT2 output is tied to (same as) wte in original model
+        self._write_shared_tensor("output.weight", "token_embd.weight")
 
-            # note: GPT2 output is tied to (same as) wte in original model
-            if new_name == "token_embd.weight":
-                print(f"output.weight, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
-                self.gguf_param_store.add_tensor("output.weight", data)
 
 
 class Phi2Model(GGUFExportedModelDescriptor):
@@ -1110,26 +1096,13 @@ class PlamoModel(GGUFExportedModelDescriptor):
 
             old_dtype = data_torch.dtype
 
-            # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
-                data_torch = data_torch.to(torch.float32)
-
+            self._write_default_tensor_type(name, data_torch.dtype)
             data = data_torch.squeeze().numpy()
 
             n_dims = len(data.shape)
             data_dtype = data.dtype
 
-            # if f32 desired, convert any float16 to float32
-            if self.ftype == 0 and data_dtype == np.float16:
-                data = data.astype(np.float32)
-
-            # TODO: Why cant we use these float16 as-is? There should be not reason to store float16 as float32
-            if self.ftype == 1 and data_dtype == np.float16 and n_dims == 1:
-                data = data.astype(np.float32)
-
-            # if f16 desired, convert any float32 2-dim weight tensors to float16
-            if self.ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
-                data = data.astype(np.float16)
+            self._write_tensor_type_from_ftype(name, torch_dtype)
 
             print(f"{new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
 
@@ -1141,4 +1114,5 @@ def get_gguf_params(model: PreTrainedModel) -> Dict[str, Any]:
         model_descriptor_class = GGUFExportedModelDescriptor.from_model_architecture(model.__class__.__name__)
         model_descriptor_instance = model_descriptor_class(model)
         model_descriptor_instance.set_gguf_parameters()
+        model_descriptor_instance.write_tensors()
     return {"gguf_version": GGUF_VERSION, **model_descriptor_instance.get_params_dict()}

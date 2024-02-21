@@ -406,6 +406,9 @@ def export_pytorch(
         ov_model.set_rt_info(gguf_params["kv_types"], "gguf_kv_types")
         ov_model.set_rt_info(gguf_params["tensor_name_map"], "gguf_tensor_name_map")
         ov_model.set_rt_info(gguf_params["tensor_shape_map"], "gguf_tensor_shape_map")
+        ov_model.set_rt_info(gguf_params["tensor_type_map"], "gguf_tensor_type_map")
+        ov_model.set_rt_info(gguf_params["transpose_permutations"], "gguf_transpose_permutations")
+        ov_model.set_rt_info(gguf_params["expected_tensor_shapes"], "gguf_expected_tensor_shapes")
         print("VSHAMPOR: success")
         ordered_dummy_inputs = {param: dummy_inputs[param] for param in sig.parameters if param in dummy_inputs}
         ordered_input_names = list(inputs)
