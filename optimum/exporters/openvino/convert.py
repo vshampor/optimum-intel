@@ -401,7 +401,11 @@ def export_pytorch(
         print("VSHAMPOR: get_gguf_params")
         gguf_params = get_gguf_params(model)
         print("VSHAMPOR: set_rt_info")
-        ov_model.set_rt_info(gguf_params, "gguf_params")
+        ov_model.set_rt_info(gguf_params["gguf_version"], "gguf_version")
+        ov_model.set_rt_info(gguf_params["kv"], "gguf_kv_params")
+        ov_model.set_rt_info(gguf_params["kv_types"], "gguf_kv_types")
+        ov_model.set_rt_info(gguf_params["tensor_name_map"], "gguf_tensor_name_map")
+        ov_model.set_rt_info(gguf_params["tensor_shape_map"], "gguf_tensor_shape_map")
         print("VSHAMPOR: success")
         ordered_dummy_inputs = {param: dummy_inputs[param] for param in sig.parameters if param in dummy_inputs}
         ordered_input_names = list(inputs)

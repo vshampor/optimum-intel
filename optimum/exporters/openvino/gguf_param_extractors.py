@@ -45,8 +45,7 @@ class GGUFParamStore:
         self.add_string(Keys.General.ARCHITECTURE, self.arch)
 
     def get_params_dict(self) -> Dict[str, Any]:
-        retval = {"gguf_version": GGUF_VERSION,
-                  **self.kv_data}
+        retval = {**self.kv_data}
         return retval
 
     def add_uint8(self, key: str, val: int) -> None:
@@ -285,8 +284,6 @@ class GGUFExportedModelDescriptor:
             gguf_name = tensor_map.get_name(torch_name, try_suffixes=(".weight", ".bias"))
             if gguf_name is None:
                 print(f"Can not map tensor {torch_name!r}")
-                import pdb
-                pdb.set_trace()
             retval[torch_name] = gguf_name
         return retval
 
@@ -299,8 +296,9 @@ class GGUFExportedModelDescriptor:
 
     def get_params_dict(self) -> Dict[str, Any]:
         retval = {"tensor_name_map": self.get_tensor_name_map(),
-                  "tensor_shape_map": self.get_tensor_shape_map()}
-        retval.update(self.gguf_param_store.get_params_dict())
+                  "tensor_shape_map": self.get_tensor_shape_map(),
+                  "kv": self.gguf_param_store.get_params_dict(),
+                  "kv_types": self.gguf_param_store.kv_types.copy()}
         return retval
 
     @staticmethod
@@ -1143,4 +1141,4 @@ def get_gguf_params(model: PreTrainedModel) -> Dict[str, Any]:
         model_descriptor_class = GGUFExportedModelDescriptor.from_model_architecture(model.__class__.__name__)
         model_descriptor_instance = model_descriptor_class(model)
         model_descriptor_instance.set_gguf_parameters()
-    return model_descriptor_instance.get_params_dict()
+    return {"gguf_version": GGUF_VERSION, **model_descriptor_instance.get_params_dict()}

@@ -3,13 +3,13 @@ import openvino.runtime as ov
 core = ov.Core()
 model = core.read_model("/home/vshampor/work/optimum-intel/ov_model/openvino_model.xml")
 
-if model.has_rt_info("gguf_params"):
+if model.has_rt_info("gguf_kv_params") and model.has_rt_info("gguf_tensor_name_map") and model.has_rt_info("gguf_tensor_shape_map"):
     print("VSHAMPOR: model has rt_info")
-    gguf_params = model.get_rt_info("gguf_params")
+    gguf_params = model.get_rt_info("gguf_kv_params")
     gguf_params_dict = gguf_params.astype(dict)
     print(list(gguf_params_dict.keys()))
-    tensor_map = gguf_params_dict["tensor_name_map"]
-    tensor_shape_map = gguf_params_dict["tensor_shape_map"]
+    tensor_map = model.get_rt_info("gguf_tensor_name_map").astype(dict)
+    tensor_shape_map = model.get_rt_info("gguf_tensor_shape_map").astype(dict)
     tensor_map_decoded = {k: v.astype(str) for k, v in tensor_map.items()}
     tensor_shape_map_decoded = {k: v.astype(str).replace(' ', '') for k, v in tensor_shape_map.items()}
     print(f"VSHAMPOR: {len(tensor_map_decoded)} tensors required by GGUF")
