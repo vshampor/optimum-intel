@@ -404,6 +404,7 @@ def export_pytorch(
         ov_model.set_rt_info(gguf_params["gguf_version"], "gguf_version")
         ov_model.set_rt_info(gguf_params["kv"], "gguf_kv_params")
         ov_model.set_rt_info(gguf_params["kv_types"], "gguf_kv_types")
+        ov_model.set_rt_info(gguf_params["kv_array_types"], "gguf_kv_array_types")
         ov_model.set_rt_info(gguf_params["tensor_name_map"], "gguf_tensor_name_map")
         ov_model.set_rt_info(gguf_params["tensor_shape_map"], "gguf_tensor_shape_map")
         ov_model.set_rt_info(gguf_params["tensor_type_map"], "gguf_tensor_type_map")

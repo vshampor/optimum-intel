@@ -45,9 +45,12 @@ class GGUFParamStore:
         self.arch = arch
         self.kv_data: Dict[str, Any] = {}
         self.kv_types: Dict[str, GGUFValueType] = {}
+        self.kv_array_types: Dict[str, GGUFValueType] = {}
         self.add_string(Keys.General.ARCHITECTURE, self.arch)
+        self.vocab_size = None
 
     def get_params_dict(self) -> Dict[str, Any]:
+        self.add_token_merges(["invalid"]) # won't actually use the tokenizer merge data, but the llama.cpp parsing code requires the key to be present
         retval = {**self.kv_data}
         return retval
 
@@ -107,6 +110,7 @@ class GGUFParamStore:
 
         self.kv_data[key] = val
         self.kv_types[key] = GGUFValueType.ARRAY
+        self.kv_array_types[key] = GGUFValueType.get_type(val[0])
 
     # Specialized add_* functions start here
     def add_architecture(self) -> None:
@@ -198,6 +202,9 @@ class GGUFParamStore:
     def add_tokenizer_model(self, model: str) -> None:
         self.add_string(Keys.Tokenizer.MODEL, model)
 
+    def add_vocab_size(self, vocab_size: int) -> None:
+        self.vocab_size = vocab_size
+
     def add_token_list(self, tokens: Sequence[str] | Sequence[bytes] | Sequence[bytearray]) -> None:
         self.add_array(Keys.Tokenizer.LIST, tokens)
 
@@ -279,6 +286,48 @@ class GGUFExportedModelDescriptor:
             self.gguf_param_store.add_expert_used_count(n_experts_used)
 
         self.gguf_param_store.add_parallel_residual(self.hparams.get("use_parallel_residual", True))
+
+    def set_vocab(self):
+        self._set_vocab_gpt2()
+
+    def _set_vocab_gpt2(self):
+        hparams = self.hparams
+        tokens: list[bytearray] = []
+        toktypes: list[int] = []
+        # vocab_size = hparams.get("vocab_size")
+        # if vocab_size is None:
+        #     raise RuntimeError("Could not determine the model's vocab size")
+
+        # self.gguf_param_store.add_tokenizer_model("gpt2")
+        # self.gguf_param_store.add_vocab_size(vocab_size)
+
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(hparams["model_type"])
+        vocab_size = hparams.get("vocab_size", len(tokenizer.vocab))
+        assert max(tokenizer.vocab.values()) < vocab_size
+
+        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}
+        added_vocab = tokenizer.get_added_vocab()
+
+        for i in range(vocab_size):
+            if i not in reverse_vocab:
+                pad_token = f"[PAD{i}]".encode('utf-8')
+                tokens.append(bytearray(pad_token))
+                toktypes.append(gguf.TokenType.USER_DEFINED)
+            elif reverse_vocab[i] in added_vocab:
+                tokens.append(reverse_vocab[i])
+                if tokenizer.added_tokens_decoder[i].special:
+                    toktypes.append(gguf.TokenType.CONTROL)
+                else:
+                    toktypes.append(gguf.TokenType.USER_DEFINED)
+            else:
+                tokens.append(reverse_vocab[i])
+                toktypes.append(gguf.TokenType.NORMAL)
+
+        self.gguf_param_store.add_tokenizer_model("gpt2")
+        self.gguf_param_store.add_token_list(tokens)
+        self.gguf_param_store.add_token_types(toktypes)
+
 
     def write_tensors(self):
         tensor_map = gguf.get_tensor_name_map(self.model_arch, self._block_count)
@@ -366,7 +415,9 @@ class GGUFExportedModelDescriptor:
                   "transpose_permutations": self._transpose_permutations.copy(),
                   "expected_tensor_shapes": self._val_to_str(self._expected_tensor_shapes.copy()),
                   "kv": self.gguf_param_store.get_params_dict(),
-                  "kv_types": self.gguf_param_store.kv_types.copy()}
+                  "kv_types": self.gguf_param_store.kv_types.copy(),
+                  "kv_array_types": self.gguf_param_store.kv_array_types.copy(),
+                  }
         return retval
 
     @staticmethod
@@ -1114,5 +1165,6 @@ def get_gguf_params(model: PreTrainedModel) -> Dict[str, Any]:
         model_descriptor_class = GGUFExportedModelDescriptor.from_model_architecture(model.__class__.__name__)
         model_descriptor_instance = model_descriptor_class(model)
         model_descriptor_instance.set_gguf_parameters()
+        model_descriptor_instance.set_vocab()
         model_descriptor_instance.write_tensors()
     return {"gguf_version": GGUF_VERSION, **model_descriptor_instance.get_params_dict()}
