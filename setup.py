@@ -48,6 +48,7 @@ EXTRAS_REQUIRE = {
         "openvino>=2023.3",
         "onnx",
         "onnxruntime",
+        "gguf"
     ],
     "openvino-tokenizers": ["openvino-tokenizers[transformers]"],
     "nncf": ["nncf>=2.8.1"],
