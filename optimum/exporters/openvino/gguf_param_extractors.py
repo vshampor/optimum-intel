@@ -248,6 +248,9 @@ class GGUFExportedModelDescriptor:
         self.model = model
         self.ftype = gguf.GGMLQuantizationType.F32
         self.hparams = self.model.config.to_dict()
+        from transformers.utils.hub import cached_file
+        self.model_files_dir = Path(cached_file(self.model.name_or_path, 'tokenizer.json')).parent
+
         self._block_count = self.hparams.get("n_layers", self.hparams.get("num_hidden_layers", self.hparams.get("n_layer")))
         self.model_arch = self._get_model_architecture()
         self.gguf_param_store = GGUFParamStore(gguf.MODEL_ARCH_NAMES[self.model_arch])
@@ -327,6 +330,9 @@ class GGUFExportedModelDescriptor:
         self.gguf_param_store.add_tokenizer_model("gpt2")
         self.gguf_param_store.add_token_list(tokens)
         self.gguf_param_store.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.model_files_dir, load_merges=True)
+        special_vocab.add_to_gguf(self.gguf_param_store)
 
 
     def write_tensors(self):
