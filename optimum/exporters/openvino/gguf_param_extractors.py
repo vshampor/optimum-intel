@@ -241,6 +241,11 @@ class GGUFParamStore:
     def add_chat_template(self, value: str) -> None:
         self.add_string(Keys.Tokenizer.CHAT_TEMPLATE, value)
 
+    def add_key_length(self, length: int) -> None:
+        self.add_uint32("{arch}.attention.key_length".format(arch=self.arch), length)
+
+    def add_value_length(self, length: int) -> None:
+        self.add_uint32("{arch}.attention.value_length".format(arch=self.arch), length)
 
 
 class GGUFExportedModelDescriptor:
@@ -334,6 +339,59 @@ class GGUFExportedModelDescriptor:
         special_vocab = gguf.SpecialVocab(self.model_files_dir, load_merges=True)
         special_vocab.add_to_gguf(self.gguf_param_store)
 
+
+    def _set_vocab_sentencepiece(self):
+        from sentencepiece import SentencePieceProcessor
+
+        tokenizer_path = self.model_files_dir / 'tokenizer.model'
+
+        tokens: list[bytes] = []
+        scores: list[float] = []
+        toktypes: list[int] = []
+
+        if not tokenizer_path.is_file():
+            print(f'Error: Missing {tokenizer_path}', file=sys.stderr)
+            sys.exit(1)
+
+        tokenizer = SentencePieceProcessor(str(tokenizer_path))
+        vocab_size = self.hparams.get('vocab_size', tokenizer.vocab_size())
+
+        for token_id in range(vocab_size):
+            piece = tokenizer.id_to_piece(token_id)
+            text = piece  #.encode("utf-8")
+            score = tokenizer.get_score(token_id)
+
+            toktype = SentencePieceTokenTypes.NORMAL
+            if tokenizer.is_unknown(token_id):
+                toktype = SentencePieceTokenTypes.UNKNOWN
+            elif tokenizer.is_control(token_id):
+                toktype = SentencePieceTokenTypes.CONTROL
+            elif tokenizer.is_unused(token_id):
+                toktype = SentencePieceTokenTypes.UNUSED
+            elif tokenizer.is_byte(token_id):
+                toktype = SentencePieceTokenTypes.BYTE
+
+            tokens.append(text)
+            scores.append(score)
+            toktypes.append(toktype)
+
+        added_tokens_file = self.model_files_dir / 'added_tokens.json'
+        if added_tokens_file.is_file():
+            with open(added_tokens_file, "r", encoding="utf-8") as f:
+                added_tokens_json = json.load(f)
+
+                for key in added_tokens_json:
+                    tokens.append(key)  #.encode("utf-8"))
+                    scores.append(-1000.0)
+                    toktypes.append(SentencePieceTokenTypes.USER_DEFINED)
+
+        self.gguf_param_store.add_tokenizer_model("llama")
+        self.gguf_param_store.add_token_list(tokens)
+        self.gguf_param_store.add_token_scores(scores)
+        self.gguf_param_store.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.model_files_dir, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_param_store)
 
     def write_tensors(self):
         tensor_map = gguf.get_tensor_name_map(self.model_arch, self._block_count)
@@ -456,6 +514,8 @@ class GGUFExportedModelDescriptor:
             return Phi2Model
         if model_architecture == "PlamoForCausalLM":
             return PlamoModel
+        if model_architecture == "GemmaForCausalLM":
+            return GemmaModel
         return GGUFExportedModelDescriptor
 
     def _get_model_architecture(self) -> gguf.MODEL_ARCH:
@@ -488,6 +548,8 @@ class GGUFExportedModelDescriptor:
             return gguf.MODEL_ARCH.PHI2
         if arch == "PlamoForCausalLM":
             return gguf.MODEL_ARCH.PLAMO
+        if arch == "GemmaForCausalLM":
+            return gguf.MODEL_ARCH.GEMMA
 
         raise NotImplementedError(f'Architecture "{arch}" not supported!')
 
@@ -1068,7 +1130,6 @@ class GPT2Model(GGUFExportedModelDescriptor):
                 continue
 
             self._tensor_name_map[new_name] = name
-
             self._tensor_shape_map[new_name] = list(data_torch.shape)
 
             # convert any unsupported data types to float32
@@ -1164,6 +1225,57 @@ class PlamoModel(GGUFExportedModelDescriptor):
             print(f"{new_name}, n_dims = {n_dims}, {old_dtype} --> {data.dtype}")
 
             self.gguf_param_store.add_tensor(new_name, data)
+
+class GemmaModel(GGUFExportedModelDescriptor):
+    def set_vocab(self):
+        self._set_vocab_sentencepiece()
+
+    def set_gguf_parameters(self):
+        hparams = self.hparams
+        block_count = hparams["num_hidden_layers"]
+
+        self.gguf_param_store.add_name(self.model.name_or_path)
+        self.gguf_param_store.add_context_length(hparams["max_position_embeddings"])
+        self.gguf_param_store.add_embedding_length(hparams["hidden_size"])
+        self.gguf_param_store.add_block_count(block_count)
+        self.gguf_param_store.add_feed_forward_length(hparams["intermediate_size"])
+        self.gguf_param_store.add_head_count(hparams["num_attention_heads"])
+        self.gguf_param_store.add_head_count_kv(self.hparams["num_key_value_heads"] if "num_key_value_heads" in hparams else hparams["num_attention_heads"])
+        self.gguf_param_store.add_layer_norm_rms_eps(self.hparams["rms_norm_eps"])
+        self.gguf_param_store.add_key_length(hparams["head_dim"])
+        self.gguf_param_store.add_value_length(hparams["head_dim"])
+        self.gguf_param_store.add_file_type(self.ftype)
+
+    def write_tensors(self):
+        block_count = self.hparams.get("n_layers", self.hparams.get("num_hidden_layers", self.hparams.get("n_layer")))
+        tensor_map = gguf.get_tensor_name_map(self.model_arch, block_count)
+
+        for name, data_torch in self.get_tensors():
+            # ref: https://github.com/huggingface/transformers/blob/fc37f38915372c15992b540dfcbbe00a916d4fc6/src/transformers/models/gemma/modeling_gemma.py#L89
+            #if name.endswith("norm.weight"):
+            #    data_torch = data_torch + 1  # WARNING (vshampor): won't do this here, this must be taken care of in the LLAMA_CPP plugin conversion stage
+
+            # map tensor names
+
+            if name == "lm_head.weight":
+                continue  # looks like this is not needed since the HF version does not have this weight saved
+
+            new_name = tensor_map.get_name(name, try_suffixes=(".weight", ".bias"))
+            if new_name is None:
+                print(f"Can not map tensor {name!r}")
+                import pdb
+                pdb.set_trace()
+                sys.exit()
+
+            self._tensor_name_map[new_name] = name
+            self._tensor_shape_map[new_name] = list(data_torch.shape)
+
+            # convert any unsupported data types to float32
+            self._write_default_tensor_type(new_name, data_torch.dtype)
+            self._write_tensor_type_from_ftype(new_name, data_torch.dtype)
+
+            data = data_torch.squeeze().numpy()
+            self._expected_tensor_shapes[new_name] = list(data.shape)
 
 
 def get_gguf_params(model: PreTrainedModel) -> Dict[str, Any]:
